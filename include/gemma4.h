@@ -26,7 +26,7 @@ struct Gemma4Config {
     int sliding_window = 1024;
     float rope_theta_sliding = 10000.0f;
     
-    // Full Attention config (Gemma-4 Global Attention)
+    // Full Attention config
     int num_global_key_value_heads = 4;
     int global_head_dim = 512;
     float rope_theta_full = 1000000.0f;
@@ -75,7 +75,6 @@ public:
     void forward(int token_id, int pos, float* out_logits);
     void forward_batch(const std::vector<int>& tokens, int start_pos, float* out_logits_last);
     void reset_cache();
-    void prefetch_layer(int layer_idx);
 
     const Gemma4Config& get_config() const { return config; }
 
@@ -89,16 +88,18 @@ private:
     std::vector<LayerWeights> layers;
     std::vector<KVCache> kv_caches;
     
-    // Scratch activation buffers (sized for max dimensions: global_q_dim = 16384)
+    // Scratch activation buffers
     std::vector<float> x_buf;              // [5376]
     std::vector<float> x_norm;             // [5376]
     std::vector<float> q_buf;              // [16384]
     std::vector<float> k_buf;              // [4096]
     std::vector<float> v_buf;              // [4096]
     std::vector<float> attn_out;           // [5376]
+    std::vector<float> head_outputs;       // [16384]
     std::vector<float> gate_buf;           // [21504]
     std::vector<float> up_buf;             // [21504]
     std::vector<float> mlp_out;            // [5376]
+    std::vector<float> thread_scores;      // [32 x 1024]
 
     // Batched scratch buffers
     std::vector<float> batch_x;            // [batch_size x 5376]
@@ -110,6 +111,7 @@ private:
     std::vector<float> batch_up;           // [batch_size x 21504]
     std::vector<float> batch_mlp_out;      // [batch_size x 5376]
     std::vector<float> batch_attn_out;     // [batch_size x 5376]
+    std::vector<float> batch_head_outs;    // [batch_size x 16384]
 };
 
 } // namespace gemma4

@@ -63,8 +63,7 @@ bool Gemma4Model::load(const std::string& model_dir) {
         layers[i].k_proj = get_ptr("self_attn.k_proj.weight");
         layers[i].v_proj = get_ptr("self_attn.v_proj.weight");
         if (!layers[i].v_proj) {
-            // Gemma-4 Full Attention layers share K as V (attention_k_eq_v == true)
-            layers[i].v_proj = layers[i].k_proj;
+            layers[i].v_proj = layers[i].k_proj; // attention_k_eq_v == true
         }
         layers[i].o_proj = get_ptr("self_attn.o_proj.weight");
         layers[i].q_norm = get_ptr("self_attn.q_norm.weight");
@@ -74,28 +73,30 @@ bool Gemma4Model::load(const std::string& model_dir) {
         layers[i].up_proj = get_ptr("mlp.up_proj.weight");
         layers[i].down_proj = get_ptr("mlp.down_proj.weight");
         
-        // Allocate KV cache (max 4096 tokens)
+        // Sized KV cache: 512 context tokens (fast, lightweight, cache-friendly)
+        size_t max_seq = 512;
         size_t kv_dim = (layers[i].type == LayerType::FULL_ATTENTION) ? 
                         (config.num_global_key_value_heads * config.global_head_dim) : // 4 * 512 = 2048
                         (config.num_key_value_heads * config.head_dim);               // 16 * 256 = 4096
-        kv_caches[i].k_cache.resize(4096 * kv_dim, 0.0f);
-        kv_caches[i].v_cache.resize(4096 * kv_dim, 0.0f);
+        kv_caches[i].k_cache.resize(max_seq * kv_dim, 0.0f);
+        kv_caches[i].v_cache.resize(max_seq * kv_dim, 0.0f);
         kv_caches[i].cur_len = 0;
     }
     
-    // Allocate activation scratchpads
+    // Allocate activation scratchpads once
     x_buf.resize(config.hidden_size);
     x_norm.resize(config.hidden_size);
-    q_buf.resize(32 * config.global_head_dim); // max 32 * 512 = 16384
-    k_buf.resize(16 * config.head_dim);        // max 16 * 256 = 4096
-    v_buf.resize(16 * config.head_dim);        // max 16 * 256 = 4096
+    q_buf.resize(32 * config.global_head_dim); // 16384
+    k_buf.resize(16 * config.head_dim);        // 4096
+    v_buf.resize(16 * config.head_dim);        // 4096
     attn_out.resize(config.hidden_size);
+    head_outputs.resize(32 * config.global_head_dim);
     gate_buf.resize(config.intermediate_size);
     up_buf.resize(config.intermediate_size);
     mlp_out.resize(config.hidden_size);
+    thread_scores.resize(32 * 1024, 0.0f);
 
-    // Max prefill batch size = 64
-    size_t max_batch = 64;
+    size_t max_batch = 32;
     batch_x.resize(max_batch * config.hidden_size);
     batch_norm.resize(max_batch * config.hidden_size);
     batch_q.resize(max_batch * 32 * config.global_head_dim);
@@ -105,6 +106,7 @@ bool Gemma4Model::load(const std::string& model_dir) {
     batch_up.resize(max_batch * config.intermediate_size);
     batch_mlp_out.resize(max_batch * config.hidden_size);
     batch_attn_out.resize(max_batch * config.hidden_size);
+    batch_head_outs.resize(max_batch * 32 * config.global_head_dim);
     
     std::cout << "[Gemma4Model] Successfully bound all 60 transformer layers with zero-copy mmap!" << std::endl;
     return true;
@@ -114,13 +116,6 @@ void Gemma4Model::reset_cache() {
     for (auto& cache : kv_caches) {
         cache.cur_len = 0;
     }
-}
-
-void Gemma4Model::prefetch_layer(int layer_idx) {
-    if (layer_idx < 0 || layer_idx >= config.num_hidden_layers) return;
-    std::string pfx = "model.language_model.layers." + std::to_string(layer_idx) + ".";
-    loader.prefetch_tensor(pfx + "self_attn.q_proj.weight");
-    loader.prefetch_tensor(pfx + "mlp.gate_proj.weight");
 }
 
 void Gemma4Model::forward(int token_id, int pos, float* out_logits) {
@@ -140,10 +135,6 @@ void Gemma4Model::forward(int token_id, int pos, float* out_logits) {
     // 2. Pass through 60 Transformer Layers
     for (int l = 0; l < config.num_hidden_layers; ++l) {
         const auto& layer = layers[l];
-        
-        if (l + 1 < config.num_hidden_layers) {
-            prefetch_layer(l + 1);
-        }
         
         float scalar = 1.0f;
         if (layer.layer_scalar) {
@@ -184,29 +175,25 @@ void Gemma4Model::forward(int token_id, int pos, float* out_logits) {
         }
         
         auto& cache = kv_caches[l];
-        int store_idx = pos % 4096;
+        int store_idx = pos % 512;
         memcpy(cache.k_cache.data() + store_idx * kv_dim, k_buf.data(), kv_dim * sizeof(float));
         memcpy(cache.v_cache.data() + store_idx * kv_dim, v_buf.data(), kv_dim * sizeof(float));
         if (pos >= cache.cur_len) cache.cur_len = pos + 1;
         
-        int window_size = (layer.type == LayerType::SLIDING_ATTENTION) ? config.sliding_window : 4096;
+        int window_size = (layer.type == LayerType::SLIDING_ATTENTION) ? config.sliding_window : 512;
         int start_pos = std::max(0, pos - window_size + 1);
         int num_context = pos - start_pos + 1;
         float qk_scale = 1.0f / sqrtf((float)head_dim);
         
-        std::vector<float> head_outputs(q_dim, 0.0f);
-        
-        #pragma omp parallel for schedule(static)
         for (int qh = 0; qh < n_q_heads; ++qh) {
             int kvh = qh / gqa_ratio;
             const float* q_ptr = q_buf.data() + qh * head_dim;
-            
-            std::vector<float> local_scores(num_context);
+            float* local_scores = thread_scores.data() + qh * 1024;
             float max_score = -1e9f;
             
             for (int ci = 0; ci < num_context; ++ci) {
                 int ctx_pos = start_pos + ci;
-                const float* k_ptr = cache.k_cache.data() + (ctx_pos % 4096) * kv_dim + kvh * head_dim;
+                const float* k_ptr = cache.k_cache.data() + (ctx_pos % 512) * kv_dim + kvh * head_dim;
                 
                 float dot = 0.0f;
                 for (int d = 0; d < head_dim; ++d) {
@@ -231,7 +218,7 @@ void Gemma4Model::forward(int token_id, int pos, float* out_logits) {
             for (int ci = 0; ci < num_context; ++ci) {
                 int ctx_pos = start_pos + ci;
                 float weight = local_scores[ci] * inv_sum;
-                const float* v_ptr = cache.v_cache.data() + (ctx_pos % 4096) * kv_dim + kvh * head_dim;
+                const float* v_ptr = cache.v_cache.data() + (ctx_pos % 512) * kv_dim + kvh * head_dim;
                 for (int d = 0; d < head_dim; ++d) {
                     out_h[d] += weight * v_ptr[d];
                 }
@@ -349,7 +336,7 @@ void Gemma4Model::forward_batch(const std::vector<int>& tokens, int start_pos, f
                 simd::apply_rope(q_ptr, k_ptr, n_q_heads, n_kv_heads, head_dim, head_dim, pos, config.rope_theta_sliding);
             }
             
-            int store_idx = pos % 4096;
+            int store_idx = pos % 512;
             memcpy(cache.k_cache.data() + store_idx * kv_dim, k_ptr, kv_dim * sizeof(float));
             memcpy(cache.v_cache.data() + store_idx * kv_dim, v_ptr, kv_dim * sizeof(float));
             if (pos >= cache.cur_len) cache.cur_len = pos + 1;
@@ -357,24 +344,22 @@ void Gemma4Model::forward_batch(const std::vector<int>& tokens, int start_pos, f
         
         // Multi-Head Attention for each token in batch
         float qk_scale = 1.0f / sqrtf((float)head_dim);
-        std::vector<float> batch_head_outs(B * q_dim, 0.0f);
         
-        #pragma omp parallel for collapse(2) schedule(static)
         for (size_t b = 0; b < B; ++b) {
             for (int qh = 0; qh < n_q_heads; ++qh) {
                 int pos = start_pos + static_cast<int>(b);
                 int kvh = qh / gqa_ratio;
                 const float* q_ptr = batch_q.data() + b * q_dim + qh * head_dim;
+                float* local_scores = thread_scores.data() + qh * 1024;
                 
-                int window_size = (layer.type == LayerType::SLIDING_ATTENTION) ? config.sliding_window : 4096;
+                int window_size = (layer.type == LayerType::SLIDING_ATTENTION) ? config.sliding_window : 512;
                 int s_pos = std::max(0, pos - window_size + 1);
                 int n_ctx = pos - s_pos + 1;
                 
-                std::vector<float> local_scores(n_ctx);
                 float max_s = -1e9f;
                 for (int ci = 0; ci < n_ctx; ++ci) {
                     int ctx_pos = s_pos + ci;
-                    const float* k_c = cache.k_cache.data() + (ctx_pos % 4096) * kv_dim + kvh * head_dim;
+                    const float* k_c = cache.k_cache.data() + (ctx_pos % 512) * kv_dim + kvh * head_dim;
                     float dot = 0.0f;
                     for (int d = 0; d < head_dim; ++d) dot += q_ptr[d] * k_c[d];
                     float s = 30.0f * tanhf((dot * qk_scale) / 30.0f);
@@ -395,7 +380,7 @@ void Gemma4Model::forward_batch(const std::vector<int>& tokens, int start_pos, f
                 for (int ci = 0; ci < n_ctx; ++ci) {
                     int ctx_pos = s_pos + ci;
                     float w = local_scores[ci] * inv_s;
-                    const float* v_c = cache.v_cache.data() + (ctx_pos % 4096) * kv_dim + kvh * head_dim;
+                    const float* v_c = cache.v_cache.data() + (ctx_pos % 512) * kv_dim + kvh * head_dim;
                     for (int d = 0; d < head_dim; ++d) out_h[d] += w * v_c[d];
                 }
             }
