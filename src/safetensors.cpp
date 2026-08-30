@@ -2,6 +2,7 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <algorithm>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
