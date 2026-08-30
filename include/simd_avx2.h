@@ -92,8 +92,6 @@ static inline void gemv_bf16_f32(const uint16_t* __restrict__ W_bf16,
 }
 
 // High-Throughput 4-Row Register-Tiled Batched Matrix-Matrix Multiplication (GEMM)
-// Y = W * X where X is [batch_size x in_dim], Y is [batch_size x out_dim]
-// Yields >240 tokens/second per layer on AVX2!
 static inline void gemm_bf16_f32_batched(const uint16_t* __restrict__ W_bf16,
                                          const float* __restrict__ X_f32,
                                          float* __restrict__ Y_f32,
@@ -198,14 +196,52 @@ static inline void rmsnorm_gemma(const float* __restrict__ x,
 }
 
 // In-Place Vectorized Gemma RMSNorm
-static inline void rmsnorm_gemma_inplace(float* x,
+static inline void rmsnorm_gemma_inplace(float* __restrict__ x,
                                          const uint16_t* __restrict__ w_bf16,
                                          size_t dim,
                                          float eps = 1e-6f) {
-    float tmp[5376];
-    size_t d = std::min(dim, (size_t)5376);
-    rmsnorm_gemma(x, w_bf16, tmp, d, eps);
-    memcpy(x, tmp, d * sizeof(float));
+    __m256 sum_sq = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 7 < dim; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        sum_sq = _mm256_fmadd_ps(vx, vx, sum_sq);
+    }
+    
+    __m128 lo = _mm256_castps256_ps128(sum_sq);
+    __m128 hi = _mm256_extractf128_ps(sum_sq, 1);
+    __m128 s4 = _mm_add_ps(lo, hi);
+    __m128 sh = _mm_movehdup_ps(s4);
+    __m128 s2 = _mm_add_ps(s4, sh);
+    sh = _mm_movehl_ps(sh, s2);
+    __m128 s1 = _mm_add_ss(s2, sh);
+    float total_sq = _mm_cvtss_f32(s1);
+    
+    for (; i < dim; ++i) {
+        total_sq += x[i] * x[i];
+    }
+    
+    float inv_rms = 1.0f / sqrtf((total_sq / (float)dim) + eps);
+    __m256 vinv = _mm256_set1_ps(inv_rms);
+    __m256 one = _mm256_set1_ps(1.0f);
+    
+    i = 0;
+    for (; i + 7 < dim; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m128i raw_w = _mm_loadu_si128((const __m128i*)(w_bf16 + i));
+        __m256i int_w = _mm256_cvtepu16_epi32(raw_w);
+        __m256 vw = _mm256_castsi256_ps(_mm256_slli_epi32(int_w, 16));
+        
+        __m256 scale = _mm256_add_ps(one, vw);
+        __m256 res = _mm256_mul_ps(_mm256_mul_ps(vx, vinv), scale);
+        _mm256_storeu_ps(x + i, res);
+    }
+    
+    for (; i < dim; ++i) {
+        uint32_t val = (uint32_t)w_bf16[i] << 16;
+        float fw;
+        memcpy(&fw, &val, 4);
+        x[i] = (x[i] * inv_rms) * (1.0f + fw);
+    }
 }
 
 // Vectorized GeGLU Activation: gate = gelu_pytorch_tanh(gate) * up
@@ -218,8 +254,7 @@ static inline void geglu_activation(float* __restrict__ gate, const float* __res
     __m256 v_sqrt = _mm256_set1_ps(sqrt_2_over_pi);
     __m256 v_coeff = _mm256_set1_ps(coeff);
     
-    #pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < dim; i += 8) {
+    for (size_t i = 0; i + 7 < dim; i += 8) {
         __m256 g = _mm256_loadu_ps(gate + i);
         __m256 u = _mm256_loadu_ps(up + i);
         
