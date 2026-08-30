@@ -8,13 +8,19 @@
 
 namespace gemma4 {
 
-Tokenizer::Tokenizer() {}
+Tokenizer::Tokenizer() {
+    id_to_token.resize(262144, "<unk>");
+    id_to_token[0] = "<pad>";
+    id_to_token[1] = "<eos>";
+    id_to_token[2] = "<bos>";
+}
+
 Tokenizer::~Tokenizer() {}
 
 bool Tokenizer::load(const std::string& tokenizer_json_path) {
     std::ifstream file(tokenizer_json_path);
     if (!file.is_open()) {
-        std::cerr << "[Tokenizer] Warning: Could not open " << tokenizer_json_path << ", using fallback character tokenizer" << std::endl;
+        std::cerr << "[Tokenizer] Warning: Could not open " << tokenizer_json_path << std::endl;
         return false;
     }
     
@@ -22,49 +28,71 @@ bool Tokenizer::load(const std::string& tokenizer_json_path) {
     buffer << file.rdbuf();
     std::string content = buffer.str();
     
-    // Parse vocab mapping from "vocab": { ... } in tokenizer.json
+    // Locate "vocab": { in the "model" block
     size_t vocab_pos = content.find("\"vocab\":");
-    if (vocab_pos != std::string::npos) {
-        size_t open_brace = content.find("{", vocab_pos);
-        size_t close_brace = content.find("}", open_brace);
-        if (open_brace != std::string::npos && close_brace != std::string::npos) {
-            std::string vocab_str = content.substr(open_brace + 1, close_brace - open_brace - 1);
-            size_t p = 0;
-            while (p < vocab_str.size()) {
-                size_t q1 = vocab_str.find("\"", p);
-                if (q1 == std::string::npos) break;
-                size_t q2 = vocab_str.find("\"", q1 + 1);
-                if (q2 == std::string::npos) break;
-                std::string token = vocab_str.substr(q1 + 1, q2 - q1 - 1);
-                
-                size_t colon = vocab_str.find(":", q2 + 1);
-                if (colon == std::string::npos) break;
-                size_t comma = vocab_str.find_first_of(",}", colon + 1);
-                if (comma == std::string::npos) comma = vocab_str.size();
-                
-                std::string id_str = vocab_str.substr(colon + 1, comma - colon - 1);
-                try {
-                    int id = std::stoi(id_str);
-                    token_to_id[token] = id;
-                    if ((size_t)id >= id_to_token.size()) {
-                        id_to_token.resize(id + 1);
-                    }
-                    id_to_token[id] = token;
-                } catch (...) {}
-                p = comma + 1;
+    if (vocab_pos == std::string::npos) {
+        std::cerr << "[Tokenizer] Error: \"vocab\" block not found in tokenizer.json" << std::endl;
+        return false;
+    }
+    
+    size_t open_brace = content.find("{", vocab_pos);
+    if (open_brace == std::string::npos) return false;
+    
+    size_t p = open_brace + 1;
+    size_t content_size = content.size();
+    size_t parsed_count = 0;
+    
+    while (p < content_size) {
+        // Find token string start
+        size_t q1 = content.find("\"", p);
+        if (q1 == std::string::npos) break;
+        
+        // Handle escaped quotes within token
+        size_t q2 = q1 + 1;
+        while (q2 < content_size) {
+            if (content[q2] == '\"' && content[q2 - 1] != '\\') {
+                break;
             }
+            q2++;
         }
+        if (q2 >= content_size) break;
+        
+        std::string token = content.substr(q1 + 1, q2 - q1 - 1);
+        
+        // Find colon
+        size_t colon = content.find(":", q2 + 1);
+        if (colon == std::string::npos) break;
+        
+        // Find integer ID
+        size_t id_start = content.find_first_of("0123456789", colon + 1);
+        if (id_start == std::string::npos) break;
+        
+        size_t id_end = content.find_first_not_of("0123456789", id_start);
+        if (id_end == std::string::npos) id_end = content_size;
+        
+        std::string id_str = content.substr(id_start, id_end - id_start);
+        try {
+            int id = std::stoi(id_str);
+            token_to_id[token] = id;
+            if ((size_t)id >= id_to_token.size()) {
+                id_to_token.resize(id + 1, "<unk>");
+            }
+            id_to_token[id] = token;
+            parsed_count++;
+        } catch (...) {}
+        
+        // Check if vocab block closed
+        size_t next_comma = content.find(",", id_end);
+        size_t next_close = content.find("}", id_end);
+        
+        if (next_close < next_comma || next_comma == std::string::npos) {
+            // Reached end of vocab dictionary
+            break;
+        }
+        p = next_comma + 1;
     }
     
-    if (id_to_token.empty()) {
-        // Fallback default vocab initialization
-        id_to_token.resize(262144, "<unk>");
-        id_to_token[0] = "<pad>";
-        id_to_token[1] = "<eos>";
-        id_to_token[2] = "<bos>";
-    }
-    
-    std::cout << "[Tokenizer] Loaded vocabulary of size: " << id_to_token.size() << std::endl;
+    std::cout << "[Tokenizer] Successfully loaded " << parsed_count << " vocabulary entries from tokenizer.json!" << std::endl;
     return true;
 }
 
@@ -74,13 +102,22 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos) const 
         tokens.push_back(bos_token_id);
     }
     
-    // Greedy longest matching / BPE lookup
+    // Replace space with SentencePiece prefix token " " (\xe2\x96\x81)
+    std::string sp_text = "";
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == ' ') {
+            sp_text += "\xe2\x96\x81";
+        } else {
+            sp_text += text[i];
+        }
+    }
+    
+    // Greedy longest matching
     size_t i = 0;
-    while (i < text.size()) {
+    while (i < sp_text.size()) {
         bool matched = false;
-        // Try prefixes up to length 32
-        for (size_t len = std::min((size_t)32, text.size() - i); len >= 1; --len) {
-            std::string sub = text.substr(i, len);
+        for (size_t len = std::min((size_t)32, sp_text.size() - i); len >= 1; --len) {
+            std::string sub = sp_text.substr(i, len);
             auto it = token_to_id.find(sub);
             if (it != token_to_id.end()) {
                 tokens.push_back(it->second);
@@ -90,8 +127,7 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos) const 
             }
         }
         if (!matched) {
-            // Encode as byte token or fallback
-            tokens.push_back((unsigned char)text[i]);
+            tokens.push_back((unsigned char)sp_text[i]);
             i++;
         }
     }
@@ -139,7 +175,6 @@ int Sampler::sample(float* logits, size_t vocab_size) {
         return best_id;
     }
     
-    // Temperature scaling
     float inv_temp = 1.0f / temperature;
     float max_l = logits[0];
     for (size_t i = 1; i < vocab_size; ++i) {
@@ -155,7 +190,6 @@ int Sampler::sample(float* logits, size_t vocab_size) {
         sum += p;
     }
     
-    // Top-P filtering
     std::sort(probs.begin(), probs.end(), [](const auto& a, const auto& b) {
         return a.first > b.first;
     });

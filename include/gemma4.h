@@ -69,9 +69,12 @@ public:
     // Initialize config and resolve all tensor pointers from Safetensors mmap
     bool load(const std::string& model_dir);
 
-    // Run forward pass on a single token at position `pos`
-    // Returns logits over the vocabulary (size: vocab_size)
+    // Single-token forward pass (Decode step)
     void forward(int token_id, int pos, float* out_logits);
+
+    // High-Throughput Batched Forward Pass (Prefill step / Multi-token verification)
+    // Computes logits for all tokens in `tokens` simultaneously using parallel GEMM!
+    void forward_batch(const std::vector<int>& tokens, int start_pos, float* out_logits_last);
 
     // Reset KV-cache for a fresh generation sequence
     void reset_cache();
@@ -91,7 +94,7 @@ private:
     std::vector<LayerWeights> layers;
     std::vector<KVCache> kv_caches;
     
-    // Scratch activation buffers (allocated once, zero overhead during inference)
+    // Scratch activation buffers
     std::vector<float> x_buf;              // [hidden_size]
     std::vector<float> x_norm;             // [hidden_size]
     std::vector<float> q_buf;              // [num_heads * head_dim] = [8192]
@@ -102,6 +105,17 @@ private:
     std::vector<float> up_buf;             // [intermediate_size] = [21504]
     std::vector<float> mlp_out;            // [hidden_size] = [5376]
     std::vector<float> attn_scores;        // [max_context_len]
+
+    // Batched scratch buffers for ultra-fast multi-token prefill
+    std::vector<float> batch_x;            // [batch_size x hidden_size]
+    std::vector<float> batch_norm;         // [batch_size x hidden_size]
+    std::vector<float> batch_q;            // [batch_size x 8192]
+    std::vector<float> batch_k;            // [batch_size x 4096]
+    std::vector<float> batch_v;            // [batch_size x 4096]
+    std::vector<float> batch_gate;         // [batch_size x 21504]
+    std::vector<float> batch_up;           // [batch_size x 21504]
+    std::vector<float> batch_mlp_out;      // [batch_size x 5376]
+    std::vector<float> batch_attn_out;     // [batch_size x 5376]
 };
 
 } // namespace gemma4
