@@ -91,15 +91,17 @@ static inline void gemv_bf16_f32(const uint16_t* __restrict__ W_bf16,
     }
 }
 
-// High-Throughput 4-Row Register-Tiled Batched Matrix-Matrix Multiplication (GEMM)
+// High-Throughput Canonical OpenMP Batched Matrix-Matrix Multiplication (GEMM)
 static inline void gemm_bf16_f32_batched(const uint16_t* __restrict__ W_bf16,
                                          const float* __restrict__ X_f32,
                                          float* __restrict__ Y_f32,
                                          size_t out_dim,
                                          size_t in_dim,
                                          size_t batch_size) {
+    size_t num_blocks = (out_dim + 3) / 4;
     #pragma omp parallel for schedule(static)
-    for (size_t r = 0; r < out_dim; r += 4) {
+    for (size_t block = 0; block < num_blocks; ++block) {
+        size_t r = block * 4;
         for (size_t b = 0; b < batch_size; ++b) {
             const float* x_col = X_f32 + b * in_dim;
             
