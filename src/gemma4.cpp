@@ -52,6 +52,7 @@ bool Gemma4Model::load(const std::string& model_dir) {
             return t ? t->ptr_bf16 : nullptr;
         };
         
+        layers[i].type = config.layer_types[i];
         layers[i].input_layernorm = get_ptr("input_layernorm.weight");
         layers[i].post_attention_layernorm = get_ptr("post_attention_layernorm.weight");
         layers[i].pre_feedforward_layernorm = get_ptr("pre_feedforward_layernorm.weight");
@@ -61,6 +62,10 @@ bool Gemma4Model::load(const std::string& model_dir) {
         layers[i].q_proj = get_ptr("self_attn.q_proj.weight");
         layers[i].k_proj = get_ptr("self_attn.k_proj.weight");
         layers[i].v_proj = get_ptr("self_attn.v_proj.weight");
+        if (!layers[i].v_proj) {
+            // Gemma-4 Full Attention layers share K as V (attention_k_eq_v == true)
+            layers[i].v_proj = layers[i].k_proj;
+        }
         layers[i].o_proj = get_ptr("self_attn.o_proj.weight");
         layers[i].q_norm = get_ptr("self_attn.q_norm.weight");
         layers[i].k_norm = get_ptr("self_attn.k_norm.weight");
@@ -69,10 +74,10 @@ bool Gemma4Model::load(const std::string& model_dir) {
         layers[i].up_proj = get_ptr("mlp.up_proj.weight");
         layers[i].down_proj = get_ptr("mlp.down_proj.weight");
         
-        layers[i].type = config.layer_types[i];
-        
-        // Allocate KV-cache: max 4096 context tokens for CPU generation
-        size_t kv_dim = config.num_key_value_heads * config.head_dim; // 16 * 256 = 4096 floats
+        // Allocate KV cache (max 4096 tokens)
+        size_t kv_dim = (layers[i].type == LayerType::FULL_ATTENTION) ? 
+                        (config.num_global_key_value_heads * config.global_head_dim) : // 4 * 512 = 2048
+                        (config.num_key_value_heads * config.head_dim);               // 16 * 256 = 4096
         kv_caches[i].k_cache.resize(4096 * kv_dim, 0.0f);
         kv_caches[i].v_cache.resize(4096 * kv_dim, 0.0f);
         kv_caches[i].cur_len = 0;
@@ -81,22 +86,21 @@ bool Gemma4Model::load(const std::string& model_dir) {
     // Allocate activation scratchpads
     x_buf.resize(config.hidden_size);
     x_norm.resize(config.hidden_size);
-    q_buf.resize(config.num_attention_heads * config.head_dim); // 32 * 256 = 8192
-    k_buf.resize(config.num_key_value_heads * config.head_dim); // 16 * 256 = 4096
-    v_buf.resize(config.num_key_value_heads * config.head_dim); // 16 * 256 = 4096
+    q_buf.resize(32 * config.global_head_dim); // max 32 * 512 = 16384
+    k_buf.resize(16 * config.head_dim);        // max 16 * 256 = 4096
+    v_buf.resize(16 * config.head_dim);        // max 16 * 256 = 4096
     attn_out.resize(config.hidden_size);
-    gate_buf.resize(config.intermediate_size);                  // 21504
-    up_buf.resize(config.intermediate_size);                    // 21504
+    gate_buf.resize(config.intermediate_size);
+    up_buf.resize(config.intermediate_size);
     mlp_out.resize(config.hidden_size);
-    attn_scores.resize(4096);
 
     // Max prefill batch size = 64
     size_t max_batch = 64;
     batch_x.resize(max_batch * config.hidden_size);
     batch_norm.resize(max_batch * config.hidden_size);
-    batch_q.resize(max_batch * config.num_attention_heads * config.head_dim);
-    batch_k.resize(max_batch * config.num_key_value_heads * config.head_dim);
-    batch_v.resize(max_batch * config.num_key_value_heads * config.head_dim);
+    batch_q.resize(max_batch * 32 * config.global_head_dim);
+    batch_k.resize(max_batch * 16 * config.head_dim);
+    batch_v.resize(max_batch * 16 * config.head_dim);
     batch_gate.resize(max_batch * config.intermediate_size);
     batch_up.resize(max_batch * config.intermediate_size);
     batch_mlp_out.resize(max_batch * config.hidden_size);
@@ -122,12 +126,6 @@ void Gemma4Model::prefetch_layer(int layer_idx) {
 void Gemma4Model::forward(int token_id, int pos, float* out_logits) {
     int H = config.hidden_size;             // 5376
     int I = config.intermediate_size;       // 21504
-    int n_q_heads = config.num_attention_heads;     // 32
-    int n_kv_heads = config.num_key_value_heads;   // 16
-    int head_dim = config.head_dim;         // 256
-    int kv_dim = n_kv_heads * head_dim;     // 4096
-    int q_dim = n_q_heads * head_dim;       // 8192
-    int gqa_ratio = n_q_heads / n_kv_heads; // 2
     
     // 1. Embedding lookup & scaling by sqrt(d_model)
     const uint16_t* emb_row = embed_tokens + (size_t)token_id * H;
@@ -143,7 +141,6 @@ void Gemma4Model::forward(int token_id, int pos, float* out_logits) {
     for (int l = 0; l < config.num_hidden_layers; ++l) {
         const auto& layer = layers[l];
         
-        // Prefetch next layer in background
         if (l + 1 < config.num_hidden_layers) {
             prefetch_layer(l + 1);
         }
@@ -154,12 +151,23 @@ void Gemma4Model::forward(int token_id, int pos, float* out_logits) {
             memcpy(&scalar, &val, 4);
         }
         
+        int n_q_heads = config.num_attention_heads; // 32
+        int n_kv_heads = (layer.type == LayerType::FULL_ATTENTION) ? config.num_global_key_value_heads : config.num_key_value_heads; // 4 or 16
+        int head_dim = (layer.type == LayerType::FULL_ATTENTION) ? config.global_head_dim : config.head_dim; // 512 or 256
+        int kv_dim = n_kv_heads * head_dim;         // 2048 or 4096
+        int q_dim = n_q_heads * head_dim;           // 16384 or 8192
+        int gqa_ratio = n_q_heads / n_kv_heads;     // 8 or 2
+        
         // --- A. Self-Attention Block ---
         simd::rmsnorm_gemma(x_buf.data(), layer.input_layernorm, x_norm.data(), H, config.rms_norm_eps);
         
         simd::gemv_bf16_f32(layer.q_proj, x_norm.data(), q_buf.data(), q_dim, H);
         simd::gemv_bf16_f32(layer.k_proj, x_norm.data(), k_buf.data(), kv_dim, H);
-        simd::gemv_bf16_f32(layer.v_proj, x_norm.data(), v_buf.data(), kv_dim, H);
+        if (layer.type == LayerType::FULL_ATTENTION) {
+            memcpy(v_buf.data(), k_buf.data(), kv_dim * sizeof(float)); // K=V
+        } else {
+            simd::gemv_bf16_f32(layer.v_proj, x_norm.data(), v_buf.data(), kv_dim, H);
+        }
         
         for (int h = 0; h < n_q_heads; ++h) {
             simd::rmsnorm_gemma_inplace(q_buf.data() + h * head_dim, layer.q_norm, head_dim, config.rms_norm_eps);
@@ -169,7 +177,7 @@ void Gemma4Model::forward(int token_id, int pos, float* out_logits) {
         }
         
         if (layer.type == LayerType::FULL_ATTENTION) {
-            size_t rotary_dim = (size_t)(config.partial_rotary_factor_full * head_dim);
+            size_t rotary_dim = (size_t)(config.partial_rotary_factor_full * head_dim); // 128
             simd::apply_rope(q_buf.data(), k_buf.data(), n_q_heads, n_kv_heads, head_dim, rotary_dim, pos, config.rope_theta_full);
         } else {
             simd::apply_rope(q_buf.data(), k_buf.data(), n_q_heads, n_kv_heads, head_dim, head_dim, pos, config.rope_theta_sliding);
@@ -273,12 +281,6 @@ void Gemma4Model::forward_batch(const std::vector<int>& tokens, int start_pos, f
     
     int H = config.hidden_size;             // 5376
     int I = config.intermediate_size;       // 21504
-    int n_q_heads = config.num_attention_heads;     // 32
-    int n_kv_heads = config.num_key_value_heads;   // 16
-    int head_dim = config.head_dim;         // 256
-    int kv_dim = n_kv_heads * head_dim;     // 4096
-    int q_dim = n_q_heads * head_dim;       // 8192
-    int gqa_ratio = n_q_heads / n_kv_heads; // 2
     float emb_scale = sqrtf((float)H);
     
     // 1. Batched Embedding Lookup
@@ -302,6 +304,13 @@ void Gemma4Model::forward_batch(const std::vector<int>& tokens, int start_pos, f
             memcpy(&scalar, &val, 4);
         }
         
+        int n_q_heads = config.num_attention_heads; // 32
+        int n_kv_heads = (layer.type == LayerType::FULL_ATTENTION) ? config.num_global_key_value_heads : config.num_key_value_heads; // 4 or 16
+        int head_dim = (layer.type == LayerType::FULL_ATTENTION) ? config.global_head_dim : config.head_dim; // 512 or 256
+        int kv_dim = n_kv_heads * head_dim;         // 2048 or 4096
+        int q_dim = n_q_heads * head_dim;           // 16384 or 8192
+        int gqa_ratio = n_q_heads / n_kv_heads;     // 8 or 2
+        
         // Batch RMSNorm
         for (size_t b = 0; b < B; ++b) {
             simd::rmsnorm_gemma(batch_x.data() + b * H, layer.input_layernorm, batch_norm.data() + b * H, H, config.rms_norm_eps);
@@ -310,7 +319,13 @@ void Gemma4Model::forward_batch(const std::vector<int>& tokens, int start_pos, f
         // Batched Q, K, V Projections using Matrix-Matrix Multiplication
         simd::gemm_bf16_f32_batched(layer.q_proj, batch_norm.data(), batch_q.data(), q_dim, H, B);
         simd::gemm_bf16_f32_batched(layer.k_proj, batch_norm.data(), batch_k.data(), kv_dim, H, B);
-        simd::gemm_bf16_f32_batched(layer.v_proj, batch_norm.data(), batch_v.data(), kv_dim, H, B);
+        if (layer.type == LayerType::FULL_ATTENTION) {
+            for (size_t b = 0; b < B; ++b) {
+                memcpy(batch_v.data() + b * kv_dim, batch_k.data() + b * kv_dim, kv_dim * sizeof(float));
+            }
+        } else {
+            simd::gemm_bf16_f32_batched(layer.v_proj, batch_norm.data(), batch_v.data(), kv_dim, H, B);
+        }
         
         // Per-token RoPE & KV-Cache Insertion
         auto& cache = kv_caches[l];
@@ -328,7 +343,7 @@ void Gemma4Model::forward_batch(const std::vector<int>& tokens, int start_pos, f
             }
             
             if (layer.type == LayerType::FULL_ATTENTION) {
-                size_t rotary_dim = (size_t)(config.partial_rotary_factor_full * head_dim);
+                size_t rotary_dim = (size_t)(config.partial_rotary_factor_full * head_dim); // 128
                 simd::apply_rope(q_ptr, k_ptr, n_q_heads, n_kv_heads, head_dim, rotary_dim, pos, config.rope_theta_full);
             } else {
                 simd::apply_rope(q_ptr, k_ptr, n_q_heads, n_kv_heads, head_dim, head_dim, pos, config.rope_theta_sliding);
