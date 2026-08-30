@@ -1,0 +1,7 @@
+*.o
+gemma4_cpu_engine
+*.bin
+*.pt
+__pycache__/
+.vscode/
+.idea/
