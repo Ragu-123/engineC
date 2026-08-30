@@ -33,7 +33,6 @@ static inline float dot_bf16_f32_unroll(const uint16_t* __restrict__ w_bf16, con
     
     size_t i = 0;
     for (; i + 31 < n; i += 32) {
-        // Chunk 0 & 1 (16 floats)
         __m128i raw0 = _mm_loadu_si128((const __m128i*)(w_bf16 + i));
         __m128i raw1 = _mm_loadu_si128((const __m128i*)(w_bf16 + i + 8));
         __m256 w0 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw0), 16));
@@ -43,7 +42,6 @@ static inline float dot_bf16_f32_unroll(const uint16_t* __restrict__ w_bf16, con
         acc0 = _mm256_fmadd_ps(w0, x0, acc0);
         acc1 = _mm256_fmadd_ps(w1, x1, acc1);
 
-        // Chunk 2 & 3 (16 floats)
         __m128i raw2 = _mm_loadu_si128((const __m128i*)(w_bf16 + i + 16));
         __m128i raw3 = _mm_loadu_si128((const __m128i*)(w_bf16 + i + 24));
         __m256 w2 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw2), 16));
@@ -63,7 +61,6 @@ static inline float dot_bf16_f32_unroll(const uint16_t* __restrict__ w_bf16, con
         acc0 = _mm256_fmadd_ps(w, x, acc0);
     }
     
-    // Horizontal reduction
     __m128 lo = _mm256_castps256_ps128(acc0);
     __m128 hi = _mm256_extractf128_ps(acc0, 1);
     __m128 sum4 = _mm_add_ps(lo, hi);
@@ -95,8 +92,6 @@ static inline void gemv_bf16_f32(const uint16_t* __restrict__ W_bf16,
 }
 
 // High-Throughput Batched Matrix-Matrix Multiplication (GEMM)
-// Y = W * X where X is [batch_size x in_dim], Y is [batch_size x out_dim]
-// Reuses each weight loaded from RAM across all batch_size tokens!
 static inline void gemm_bf16_f32_batched(const uint16_t* __restrict__ W_bf16,
                                          const float* __restrict__ X_f32,
                                          float* __restrict__ Y_f32,
@@ -113,7 +108,7 @@ static inline void gemm_bf16_f32_batched(const uint16_t* __restrict__ W_bf16,
     }
 }
 
-// Vectorized Gemma RMSNorm: y = (x / sqrt(mean(x^2) + eps)) * (1.0 + w)
+// Vectorized Gemma RMSNorm: out = (x / sqrt(mean(x^2) + eps)) * (1.0 + w)
 static inline void rmsnorm_gemma(const float* __restrict__ x,
                                  const uint16_t* __restrict__ w_bf16,
                                  float* __restrict__ out,
@@ -161,6 +156,14 @@ static inline void rmsnorm_gemma(const float* __restrict__ x,
         memcpy(&fw, &val, 4);
         out[i] = (x[i] * inv_rms) * (1.0f + fw);
     }
+}
+
+// In-Place Vectorized Gemma RMSNorm: x = (x / sqrt(mean(x^2) + eps)) * (1.0 + w)
+static inline void rmsnorm_gemma_inplace(float* x,
+                                         const uint16_t* __restrict__ w_bf16,
+                                         size_t dim,
+                                         float eps = 1e-6f) {
+    rmsnorm_gemma(x, w_bf16, x, dim, eps);
 }
 
 // Vectorized GeGLU Activation: gate = gelu_pytorch_tanh(gate) * up

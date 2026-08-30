@@ -162,10 +162,10 @@ void Gemma4Model::forward(int token_id, int pos, float* out_logits) {
         simd::gemv_bf16_f32(layer.v_proj, x_norm.data(), v_buf.data(), kv_dim, H);
         
         for (int h = 0; h < n_q_heads; ++h) {
-            simd::rmsnorm_gemma(q_buf.data() + h * head_dim, layer.q_norm, q_buf.data() + h * head_dim, head_dim, config.rms_norm_eps);
+            simd::rmsnorm_gemma_inplace(q_buf.data() + h * head_dim, layer.q_norm, head_dim, config.rms_norm_eps);
         }
         for (int h = 0; h < n_kv_heads; ++h) {
-            simd::rmsnorm_gemma(k_buf.data() + h * head_dim, layer.k_norm, k_buf.data() + h * head_dim, head_dim, config.rms_norm_eps);
+            simd::rmsnorm_gemma_inplace(k_buf.data() + h * head_dim, layer.k_norm, head_dim, config.rms_norm_eps);
         }
         
         if (layer.type == LayerType::FULL_ATTENTION) {
@@ -321,10 +321,10 @@ void Gemma4Model::forward_batch(const std::vector<int>& tokens, int start_pos, f
             float* v_ptr = batch_v.data() + b * kv_dim;
             
             for (int h = 0; h < n_q_heads; ++h) {
-                simd::rmsnorm_gemma(q_ptr + h * head_dim, layer.q_norm, q_ptr + h * head_dim, head_dim, config.rms_norm_eps);
+                simd::rmsnorm_gemma_inplace(q_ptr + h * head_dim, layer.q_norm, head_dim, config.rms_norm_eps);
             }
             for (int h = 0; h < n_kv_heads; ++h) {
-                simd::rmsnorm_gemma(k_ptr + h * head_dim, layer.k_norm, k_ptr + h * head_dim, head_dim, config.rms_norm_eps);
+                simd::rmsnorm_gemma_inplace(k_ptr + h * head_dim, layer.k_norm, head_dim, config.rms_norm_eps);
             }
             
             if (layer.type == LayerType::FULL_ATTENTION) {
